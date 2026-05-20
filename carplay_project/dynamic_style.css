@@ -1,0 +1,166 @@
+
+window {
+    background: #111111;
+}
+
+.background {
+    background-image: linear-gradient(
+        135deg,
+        rgba(210, 145, 77, 0.95),
+        rgba(140, 75, 7, 0.95)
+    );
+}
+
+/* SIDEBAR */
+
+.sidebar {
+    background: rgba(30,30,30,0.55);
+
+    border-radius: 35px;
+
+    padding: 30px;
+
+    min-width: 70px;
+}
+
+/* MAIN DASHBOARD */
+
+.dashboard {
+
+    background: rgba(255,255,255,0.10);
+
+    border-radius: 50px;
+
+    padding: 40px;
+}
+
+/* DATE */
+
+.date-label {
+
+    color: rgba(255,255,255,0.75);
+
+    font-size: 20px;
+
+    font-weight: 300;
+}
+
+/* CLOCK */
+
+.clock-label {
+
+    color: white;
+
+    font-size: 120px;
+
+    font-weight: 900;
+}
+
+/* ALBUM COVER */
+
+.album-cover {
+
+    border-radius: 30px;
+}
+
+/* MAP CARD */
+
+.map-card {
+
+    background: rgba(255,255,255,0.15);
+
+    border-radius: 40px;
+
+    padding: 20px;
+}
+
+.map-text {
+
+    color: rgba(255,255,255,0.5);
+
+    font-size: 42px;
+
+    font-weight: bold;
+}
+
+/* MUSIC CARD */
+
+.music-card {
+
+    background: rgba(255,255,255,0.15);
+
+    border-radius: 40px;
+
+    padding: 30px;
+}
+
+/* TEXT */
+
+.artist-label {
+
+    color: rgba(255,255,255,0.7);
+
+    font-size: 22px;
+}
+
+.song-label {
+
+    color: white;
+
+    font-size: 42px;
+
+    font-weight: 900;
+}
+
+.controls-label {
+
+    color: rgba(255,255,255,0.8);
+
+    font-size: 60px;
+}
+
+/* CIRCLE BUTTONS */
+
+.circle-button {
+
+    background: rgba(255,255,255,0.15);
+
+    border-radius: 999px;
+
+    min-width: 90px;
+    min-height: 90px;
+
+    font-size: 36px;
+
+    color: white;
+}
+
+/* SIDEBAR APPS */
+
+.sidebar-app {
+
+    background: #4dc7ff;
+
+    color: black;
+
+    border-radius: 999px;
+
+    min-width: 70px;
+    min-height: 70px;
+
+    font-size: 28px;
+}
+
+.spotify-app {
+
+    background: #1ed760;
+
+    color: black;
+
+    border-radius: 999px;
+
+    min-width: 70px;
+    min-height: 70px;
+
+    font-size: 28px;
+}
