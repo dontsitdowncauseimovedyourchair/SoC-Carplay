@@ -1050,8 +1050,8 @@ class MusicScreen(Gtk.Overlay):
 
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyOAuth(
-                client_id="5f55822a8c56431b9ca382d93c6cf518",
-                client_secret="c658ed2d3b80442d95a9876c562f0fd6",
+                client_id="6186b61db32f4eb59ae55a299ef475ad",
+                client_secret="7dea9bd274b0436fafea5b676838c71c",
                 redirect_uri="http://127.0.0.1:8888/callback",
                 scope="user-read-playback-state user-modify-playback-state",
                 cache_path="/home/root/spotify.cache",
