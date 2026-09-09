@@ -1,161 +1,138 @@
-import subprocess
-import requests
-import os
-import json
+"""Flask API for one bounded voice-assistant job at a time per server process."""
+
+if __package__ in (None, ""):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import atexit
 import base64
-import re
-from flask import Flask, request, Response
-from faster_whisper import WhisperModel
-from werkzeug.utils import secure_filename
+import hmac
+import json
+import logging
+from pathlib import Path
+import subprocess
+import tempfile
+import threading
 
-app = Flask(__name__)
+from flask import Flask, Response, request
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-PIPER_EXEC = "C:\\workspace\\piper\\piper.exe"
-VOICE_MODEL = "C:\\workspace\\piper\\voicemodels\\es_AR-daniela-high.onnx"
-
-print("Loading Whisper model...")
-whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-print("Whisper is ready!")
-
-ALLOWED_ACTIONS = {
-    "none", "volume_up", "volume_down", "volume_set",
-    "music_next", "music_prev", "music_toggle", "music_play",
-    "open_music", "open_camera", "open_map", "open_home",
-    "navigate_to",
-}
-
-SYSTEM_PROMPT = """Eres Copiloba, la asistente de voz de un auto. Eres mujer y muy entusiasta.
-Respondes SIEMPRE con un único objeto JSON, sin texto extra, con esta forma exacta:
-{"action": "...", "args": {}, "say": "..."}
-
-Acciones disponibles (usa "none" si es solo conversación):
-- "volume_up" / "volume_down": subir o bajar el volumen
-- "volume_set": fijar el volumen, args {"percent": 0-100}
-- "music_next" / "music_prev": siguiente o anterior canción
-- "music_toggle": pausar o reanudar la música
-- "music_play": reproducir algo específico, args {"query": "canción o artista"}
-- "open_music" / "open_camera" / "open_map" / "open_home": abrir esa pantalla
-- "navigate_to": trazar una ruta, args {"destination": "el lugar como lo escribirías en un mapa"}
-
-Reglas para "say":
-- ¡Muy breve, se convertirá en audio! Usa signos de exclamación.
-- Llama al conductor "Loba" al menos una vez, pero varía cómo empiezas.
-- Si ejecutas una acción, confírmala en "say".
-
-Ejemplos:
-Conductor: "bájale tantito" -> {"action":"volume_down","args":{},"say":"¡Claro Loba, le bajo un poquito!"}
-Conductor: "pon la que sigue" -> {"action":"music_next","args":{},"say":"¡Va la siguiente, Loba!"}
-Conductor: "pon algo de Bad Bunny" -> {"action":"music_play","args":{"query":"Bad Bunny"},"say":"¡Sonando Bad Bunny, Loba!"}
-Conductor: "llévame al Ángel de la Independencia" -> {"action":"navigate_to","args":{"destination":"Ángel de la Independencia, Ciudad de México"},"say":"¡Trazando la ruta, Loba!"}
-Conductor: "abre la cámara" -> {"action":"open_camera","args":{},"say":"¡Cámara lista, Loba!"}
-Conductor: "¿cómo estás?" -> {"action":"none","args":{},"say":"¡Súper bien Loba, lista para el camino!"}
-"""
+from carplay_project import config
+from carplay_project.backend.audio import InvalidAudio, validate_audio
+from carplay_project.backend.speech import PiperSynthesizer
+from carplay_project.audio_stream import CONTENT_TYPE, STREAM_VERSION, audio_event, end_event
+from carplay_project.backend.language import ask_copiloba
+from carplay_project.backend.transcription import Transcriber
+from carplay_project.commands import validate_command
 
 
-def keyword_fallback(text):
-    """Plan B por si el modelo no devuelve JSON válido."""
-    t = text.lower()
-    if re.search(r"b[aá]ja|menos volumen|m[aá]s bajito", t):
-        return {"action": "volume_down", "args": {}}
-    if re.search(r"s[uú]be|m[aá]s volumen|m[aá]s fuerte", t):
-        return {"action": "volume_up", "args": {}}
-    if re.search(r"siguiente|que sigue|c[aá]mbiale", t):
-        return {"action": "music_next", "args": {}}
-    if re.search(r"anterior|reg[rR][eé]sale", t):
-        return {"action": "music_prev", "args": {}}
-    if re.search(r"pausa|p[aá]usale|contin[uú]a|reanuda", t):
-        return {"action": "music_toggle", "args": {}}
-    if "c[aá]mara" in t or "camara" in t or "cámara" in t:
-        return {"action": "open_camera", "args": {}}
-    m = re.search(r"(?:ll[eé]vame|ruta|vamos|navega)\s+(?:a|al|hacia)\s+(.+)", t)
-    if m:
-        return {"action": "navigate_to", "args": {"destination": m.group(1).strip()}}
-    return {"action": "none", "args": {}}
+def create_app(transcriber=None, synthesizer=None):
+    app = Flask(__name__)
+    app.config.update(MAX_CONTENT_LENGTH=config.MAX_UPLOAD_BYTES,
+                      API_TOKEN=config.COPILOBA_API_TOKEN)
+    transcriber = transcriber if transcriber is not None else Transcriber()
+    synthesizer = synthesizer if synthesizer is not None else PiperSynthesizer()
+    admission = threading.Lock()
+    app.extensions["transcriber"] = transcriber
+    app.extensions["admission"] = admission
+    app.extensions["synthesizer"] = synthesizer
+    atexit.register(transcriber.close)
+    atexit.register(synthesizer.close)
+
+    @app.errorhandler(413)
+    def too_large(error):
+        return {"error": "Audio upload is too large"}, 413
+
+    @app.errorhandler(400)
+    def bad_request(error):
+        return {"error": "Malformed upload"}, 400
+
+    @app.get("/health")
+    def health():
+        # Liveness only: models load lazily and are checked by actual requests.
+        return {"status": "ok"}
+
+    @app.post("/ask_audio")
+    def ask_audio():
+        token = app.config["API_TOKEN"]
+        if token and not hmac.compare_digest(
+            request.headers.get("Authorization", "").encode(), f"Bearer {token}".encode()
+        ):
+            return {"error": "Unauthorized"}, 401
+        if not admission.acquire(blocking=False):
+            return {"error": "Assistant is busy; try again shortly"}, 503, {"Retry-After": "1"}
+        audio_stream = None
+        handed_off = False
+        released = False
+
+        def finish():
+            nonlocal released
+            if not released:
+                released = True
+                try:
+                    if audio_stream is not None:
+                        audio_stream.close()
+                finally:
+                    admission.release()
+
+        try:
+            if "audio" not in request.files:
+                return {"error": "No audio file"}, 400
+            # Never use the client filename; isolate every request and clean up on errors.
+            with tempfile.TemporaryDirectory(prefix="copiloba-upload-") as directory:
+                path = Path(directory) / "recording.wav"
+                request.files["audio"].save(path)
+                validate_audio(path)
+                prompt = transcriber.transcribe(path)
+            if not prompt.strip():
+                return {"error": "Could not hear anything"}, 400
+            command = validate_command(ask_copiloba(prompt), require_speech=True)
+            audio_stream = synthesizer.stream(command["say"])
+            # Preflight only the first PCM chunk: startup failures still return JSON.
+            first_chunk = next(audio_stream)
+            encoded = base64.b64encode(json.dumps(
+                {"action": command["action"], "args": command["args"]}
+            ).encode()).decode("ascii")
+            def events():
+                try:
+                    yield audio_event(first_chunk)
+                    for chunk in audio_stream:
+                        yield audio_event(chunk)
+                    yield end_event()
+                except (OSError, RuntimeError, ValueError, TimeoutError, EOFError):
+                    app.logger.exception("Speech stream failed")
+                    yield end_event(error=True)
+                finally:
+                    finish()
+
+            response = Response(events(), mimetype=CONTENT_TYPE, headers={
+                "X-Copiloba-Action": encoded, "X-Copiloba-Stream-Version": STREAM_VERSION,
+                "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+            })
+            response.call_on_close(finish)
+            handed_off = True
+            return response
+        except InvalidAudio as exc:
+            return {"error": str(exc)}, 400
+        except (TimeoutError, subprocess.TimeoutExpired):
+            app.logger.warning("Voice processing timed out")
+            return {"error": "Voice processing timed out; please try again"}, 504
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError, EOFError, StopIteration):
+            app.logger.exception("Voice processing failed")
+            return {"error": "Voice processing failed; please try again"}, 502
+        finally:
+            if not handed_off:
+                finish()
+
+    return app
 
 
-def ask_copiloba(prompt):
-    """One Ollama call: intent + spoken reply, as JSON."""
-    payload = {
-        "model": "llama3",
-        "prompt": SYSTEM_PROMPT + f'\nConductor: "{prompt}"\nJSON:',
-        "format": "json",          # fuerza JSON válido
-        "stream": False,
-        "options": {"temperature": 0.4},
-    }
-    try:
-        raw = requests.post(OLLAMA_URL, json=payload, timeout=60).json()["response"]
-        data = json.loads(raw)
-    except Exception as e:
-        print("Ollama/JSON error:", e)
-        cmd = keyword_fallback(prompt)
-        cmd["say"] = "¡Listo Loba!" if cmd["action"] != "none" else "¡Perdón Loba, no te entendí!"
-        return cmd
-
-    # valida y sanea lo que dijo el modelo
-    action = data.get("action", "none")
-    if action not in ALLOWED_ACTIONS:
-        action = keyword_fallback(prompt)["action"]
-    args = data.get("args") or {}
-    say = (data.get("say") or "¡Listo Loba!").strip()
-    return {"action": action, "args": args, "say": say}
-
-
-def piper_stream(text):
-    piper_cmd = [
-        PIPER_EXEC,
-        "--model", VOICE_MODEL,
-        "--output_raw",
-        "--length_scale", "0.82",
-        "--sentence_silence", "0.1",
-    ]
-    process = subprocess.Popen(
-        piper_cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    process.stdin.write(text.encode("utf-8"))
-    process.stdin.close()
-    while True:
-        chunk = process.stdout.read(4096)
-        if not chunk:
-            break
-        yield chunk
-
-
-@app.route("/ask_audio", methods=["POST"])
-def ask_copiloba_audio():
-    if "audio" not in request.files:
-        return {"error": "No audio file"}, 400
-
-    audio_file = request.files["audio"]
-    filepath = secure_filename(audio_file.filename)
-    audio_file.save(filepath)
-
-    print("Received audio from car, transcribing...")
-    segments, info = whisper_model.transcribe(filepath, beam_size=5, language="es")
-    prompt_text = " ".join(s.text for s in segments)
-    os.remove(filepath)
-    print(f"Whisper heard: {prompt_text}")
-
-    if not prompt_text.strip():
-        return {"error": "Could not hear anything"}, 400
-
-    cmd = ask_copiloba(prompt_text)
-    print(f"Action: {cmd['action']} {cmd['args']} | Say: {cmd['say']}")
-
-    # el comando viaja en un header (base64 para sobrevivir acentos);
-    header_value = base64.b64encode(
-        json.dumps({"action": cmd["action"], "args": cmd["args"]}).encode("utf-8")
-    ).decode("ascii")
-
-    return Response(
-        piper_stream(cmd["say"]),
-        mimetype="audio/raw",
-        headers={"X-Copiloba-Action": header_value},
-    )
-
+app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    from waitress import serve
+
+    logging.basicConfig(level=logging.INFO)
+    serve(app, host=config.BACKEND_HOST, port=config.BACKEND_PORT, threads=4,
+          max_request_body_size=config.MAX_UPLOAD_BYTES)

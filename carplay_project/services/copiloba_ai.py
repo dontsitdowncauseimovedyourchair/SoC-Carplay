@@ -1,77 +1,162 @@
-## services/copiloba_ai.py
-import os
-import json      # NUEVO
-import base64    # NUEVO
-import requests
+"""Single-flight voice capture, bounded backend requests, and cancellable playback."""
+
+import base64
+import json
+import logging
+from pathlib import Path
 import subprocess
+import tempfile
 import threading
+import time
+
+import requests
 from gi.repository import GLib
 
-SERVER_URL = "http://100.109.4.120:5000/ask_audio"
-AUDIO_FILE = "/tmp/driver_voice.wav"
+from carplay_project import config
+from carplay_project.commands import validate_command
+from carplay_project.audio_stream import CONTENT_TYPE, STREAM_VERSION, iter_audio
+from carplay_project.services.playback import StreamingPlayer
+
+log = logging.getLogger(__name__)
 
 
 class CopilobaAssistant:
-    def __init__(self, status_callback=None, command_callback=None):   # NUEVO param
-        # This callback allows the AI to send text updates back to the GTK screen
+    def __init__(self, status_callback=None, command_callback=None, busy_callback=None):
         self.status_callback = status_callback
-        self.command_callback = command_callback                       # NUEVO
+        self.command_callback = command_callback
+        self.busy_callback = busy_callback
+        self._busy = threading.Lock()
+        self._process_lock = threading.Lock()
+        self._process = None
+        self._closed = threading.Event()
+        self._generation = 0
 
-    def _update_ui(self, message):
-        # Safely push updates to the GTK main loop without crashing it
-        if self.status_callback:
-            GLib.idle_add(self.status_callback, message)
+    def _deliver(self, generation, callback, value):
+        if not self._closed.is_set() and generation == self._generation and callback:
+            callback(value)
+        return False
+
+    def _notify(self, callback, value):
+        GLib.idle_add(self._deliver, self._generation, callback, value)
+
+    def _run_process(self, command, timeout):
+        with self._process_lock:
+            if self._closed.is_set():
+                raise RuntimeError("Assistant stopped")
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+            self._process = process
+        try:
+            try:
+                code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+                raise
+            if code:
+                raise subprocess.CalledProcessError(code, command)
+        finally:
+            with self._process_lock:
+                self._process = None
 
     def _listen_and_ask_worker(self):
-        """This runs in the background so the dashboard doesn't freeze."""
-        self._update_ui("Háblale a Copiloba... (6s)")
-
-        # 1. Record audio
-        os.system(f"arecord -D plughw:1,0 -c 2 -d 6 -f S16_LE -r 16000 {AUDIO_FILE}")
-        self._update_ui("Pensando Lobamente...")
-
-        # 2. Send to Server
         try:
-            with open(AUDIO_FILE, 'rb') as f:
-                files = {'audio': ('driver_voice.wav', f, 'audio/wav')}
-                response = requests.post(SERVER_URL, files=files, stream=True)
+            with tempfile.TemporaryDirectory(prefix="copiloba-", dir=config.AUDIO_TEMP_DIR) as directory:
+                recording = Path(directory) / "recording.wav"
+                self._notify(self.status_callback, "Háblale a Copiloba... (6s)")
+                self._run_process([
+                    "arecord", "-D", config.AUDIO_RECORD_DEVICE, "-c", "2", "-d", "6",
+                    "-f", "S16_LE", "-r", "16000", str(recording),
+                ], config.RECORD_TIMEOUT)
+                if self._closed.is_set():
+                    return
+                self._notify(self.status_callback, "Pensando Lobamente...")
+                headers = {}
+                if config.COPILOBA_API_TOKEN:
+                    headers["Authorization"] = f"Bearer {config.COPILOBA_API_TOKEN}"
+                with recording.open("rb") as audio:
+                    with requests.post(
+                        config.COPILOBA_SERVER_URL,
+                        files={"audio": ("recording.wav", audio, "audio/wav")},
+                        headers=headers, stream=True,
+                        timeout=(5, config.ASSISTANT_READ_TIMEOUT),
+                    ) as response:
+                        if response.status_code == 503:
+                            self._notify(self.status_callback, "Copiloba está ocupada. Intenta de nuevo.")
+                            return
+                        response.raise_for_status()
+                        if response.headers.get("Content-Type", "").split(";")[0] != CONTENT_TYPE:
+                            raise ValueError("Unexpected audio response")
+                        if response.headers.get("X-Copiloba-Stream-Version") != STREAM_VERSION:
+                            raise ValueError("Unsupported audio stream version")
+                        encoded = response.headers.get("X-Copiloba-Action", "")
+                        if len(encoded) > 4096:
+                            raise ValueError("Command header is too large")
+                        command = validate_command(json.loads(base64.b64decode(encoded, validate=True)))
+                        self._play_stream(response, command)
+                self._notify(self.status_callback, "")
+        except (requests.Timeout, TimeoutError, subprocess.TimeoutExpired):
+            log.warning("Assistant operation timed out")
+            self._notify(self.status_callback, "Copiloba tardó demasiado. Intenta de nuevo.")
+        except Exception as exc:
+            log.warning("Assistant failed: %s", type(exc).__name__)
+            self._notify(self.status_callback, "No se pudo completar la solicitud. Intenta de nuevo.")
+        finally:
+            self._notify(self.busy_callback, False)
+            self._busy.release()
 
-                if response.status_code == 200:
-                    self._update_ui("Loba Loba")
+    def _play_stream(self, response, command):
+        player = None
+        deadline = time.monotonic() + config.ASSISTANT_READ_TIMEOUT
 
-                    # NUEVO: ejecutar el comando ANTES de reproducir el audio,
-                    # así el volumen/canción/ruta cambia mientras Copiloba habla
-                    cmd_b64 = response.headers.get("X-Copiloba-Action")
-                    if cmd_b64 and self.command_callback:
-                        try:
-                            cmd = json.loads(base64.b64decode(cmd_b64).decode("utf-8"))
-                            self.command_callback(cmd)
-                        except Exception as e:
-                            print(f"Action parse error: {e}")
+        def network_chunks():
+            for chunk in response.iter_content(chunk_size=1024):
+                if self._closed.is_set():
+                    raise RuntimeError("Assistant stopped")
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Audio stream timed out")
+                yield chunk
 
-                    # 3. Play audio
-                    play_process = subprocess.Popen(
-                        ['aplay', '-r', '22050', '-f', 'S16_LE', '-t', 'raw', '-c', '1'],
-                        stdin=subprocess.PIPE
-                    )
-
-                    for chunk in response.iter_content(chunk_size=4096):
-                        if chunk:
-                            play_process.stdin.write(chunk)
-
-                    play_process.stdin.close()
-                    play_process.wait()
-
-                    self._update_ui("")  # Reset UI when done
+        try:
+            for pcm in iter_audio(network_chunks(), config.MAX_RESPONSE_BYTES):
+                if player is None:
+                    with self._process_lock:
+                        if self._closed.is_set():
+                            return
+                        player = StreamingPlayer(config.PLAYBACK_TIMEOUT, self._closed)
+                        self._process = player.process
+                    # Execute once, only after validated audio reaches the player.
+                    player.write(pcm)
+                    self._notify(self.command_callback, command)
+                    self._notify(self.status_callback, "Copiloba responde...")
                 else:
-                    self._update_ui(f"Flop del servidor: {response.status_code}")
-
-        except Exception as e:
-            self._update_ui("Flop de conexión a copiloba")
-            print(f"Connection Error: {e}")
+                    player.write(pcm)
+            if player is not None:
+                player.finish()
+        finally:
+            if player is not None:
+                try:
+                    player.close()
+                finally:
+                    with self._process_lock:
+                        self._process = None
 
     def trigger_assistant(self):
-        """This is the function main.py will call when a button is pressed."""
-        # Launch the worker in a background thread instantly
-        thread = threading.Thread(target=self._listen_and_ask_worker, daemon=True)
-        thread.start()
+        if self._closed.is_set() or not self._busy.acquire(blocking=False):
+            return False
+        self._generation += 1
+        self._notify(self.busy_callback, True)
+        try:
+            threading.Thread(target=self._listen_and_ask_worker, daemon=True).start()
+        except Exception:
+            self._notify(self.busy_callback, False)
+            self._busy.release()
+            raise
+        return True
+
+    def close(self):
+        self._closed.set()
+        with self._process_lock:
+            if self._process is not None and self._process.poll() is None:
+                # kill() is immediate; the worker waits/reaps without blocking GTK.
+                self._process.kill()

@@ -1,4 +1,36 @@
-carplay_project/.vscode
-.venv
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+spotify.cache
+.cache/
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and OS metadata
+.idea/
+.vscode/
 .DS_Store
-.vscode
+
+# Runtime audio, artwork, and logs
+driver_voice.wav
+album.jpg
+current_album.jpg
+current_album_pixel.jpg
+*.log
+
+# Downloaded model files
+models/
+*.onnx
+*.onnx.json

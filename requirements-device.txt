@@ -1,0 +1,6 @@
+-r requirements.txt
+requests
+spotipy
+colorthief
+Pillow
+# PyGObject, Pycairo, and GTK/GStreamer/OsmGpsMap must be supplied by the board image.

@@ -1,0 +1,2 @@
+# Shared configuration dependency; select a host-specific file below as well.
+python-dotenv>=1.0,<2
